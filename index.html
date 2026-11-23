@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Image to Video Generator</title>
+<style>
+  body{font-family:system-ui,sans-serif;max-width:640px;margin:2rem auto;padding:0 1rem}
+  label{display:block;margin-top:1rem;font-weight:600}
+  input,textarea,button{width:100%;box-sizing:border-box;padding:.5rem;margin-top:.25rem}
+  button{cursor:pointer}
+  button:disabled{opacity:.5;cursor:wait}
+  #status{margin-top:1rem;white-space:pre-wrap}
+  #error{display:none;margin-top:1rem;padding:.75rem 1rem;background:#fde8e8;
+         border:1px solid #d33;border-radius:6px;color:#8a1111}
+  video{width:100%;margin-top:1rem}
+</style>
+</head>
+<body>
+<h1>Image to Video</h1>
+
+<label>API key <input id="key" type="password" placeholder="Your ComfyUI Cloud API key"></label>
+<label>Start image <input id="image" type="file" accept="image/*"></label>
+<label>Prompt <textarea id="prompt" rows="2">the image is walking.</textarea></label>
+<label>Negative prompt <textarea id="neg" rows="2">blurry, extra limbs, distortion</textarea></label>
+<label>Sound description <textarea id="sound" rows="2">Gentle footsteps walking on pavement, soft outdoor ambience</textarea></label>
+<button id="go">Generate</button>
+
+<div id="error" role="alert"></div>
+<div id="status"></div>
+<video id="player" controls hidden></video>
+
+<script>
+const BASE = "https://cloud.comfy.org";      // confirm against the current Cloud API docs
+const WORKFLOW_URL = "your workflow";    // your Export (API) file, next to this page
+const MAP = {                                // node ids from the exported API file
+  image:  "11",   // Input: Start image
+  prompt: "6",    // Input: Prompt
+  neg:    "9",    // Input: Negative prompt
+  sound:  "REPLACE_WITH_SOUND_NODE_ID"  // text box inside the sound group; find it in the export
+};
+const TIMEOUT_MS = 10 * 60 * 1000;
+
+const $ = id => document.getElementById(id);
+const showError = msg => { $("error").textContent = "⚠ " + msg; $("error").style.display = "block"; };
+const clearError = () => { $("error").style.display = "none"; };
+const setStatus = msg => { $("status").textContent = msg; };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function api(path, opts, key) {
+  let res;
+  try {
+    res = await fetch(BASE + path, { ...opts, headers: { ...(opts.headers || {}), "X-API-Key": key } });
+  } catch (e) {
+    throw new Error("Network error. The request was blocked or the server is unreachable (this can be CORS). " + e.message);
+  }
+  if (!res.ok) {
+    let detail = "";
+    try { detail = await res.text(); } catch (_) {}
+    if (res.status === 401 || res.status === 403) throw new Error("API key rejected (HTTP " + res.status + "). Check the key and your plan.");
+    if (res.status === 402) throw new Error("Payment or plan required (HTTP 402). " + detail.slice(0, 300));
+    if (res.status === 429) throw new Error("Rate limited (HTTP 429). Wait a bit and try again.");
+    throw new Error("HTTP " + res.status + ": " + detail.slice(0, 300));
+  }
+  return res;
+}
+
+$("go").onclick = async () => {
+  clearError(); $("player").hidden = true;
+  const key = $("key").value.trim();
+  const file = $("image").files[0];
+  const prompt = $("prompt").value.trim();
+  if (!key) return showError("Enter your API key.");
+  if (!file) return showError("Choose a start image.");
+  if (!prompt) return showError("Enter a prompt.");
+  if (MAP.sound.startsWith("REPLACE")) return showError("Set the sound node id in MAP (see the comment in the code).");
+
+  $("go").disabled = true;
+  try {
+    setStatus("Loading workflow…");
+    let wf;
+    try { wf = await (await fetch(WORKFLOW_URL)).json(); }
+    catch (e) { throw new Error("Could not load " + WORKFLOW_URL + ". Export the workflow with Export (API) and save it next to this page."); }
+
+    setStatus("Uploading image…");
+    const form = new FormData();
+    form.append("image", file);
+    const up = await (await api("/api/upload/image", { method: "POST", body: form }, key)).json();
+
+    wf[MAP.image].inputs.image = up.name;
+    wf[MAP.prompt].inputs.text = prompt;
+    wf[MAP.neg].inputs.text = $("neg").value;
+    // The sound text field is set below; its input name depends on your export, so check it.
+    const soundInputs = wf[MAP.sound].inputs;
+    const soundKey = "value" in soundInputs ? "value" : "text";
+    soundInputs[soundKey] = $("sound").value;
+
+    setStatus("Submitting job…");
+    const sub = await (await api("/api/prompt", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: wf })
+    }, key)).json();
+    if (sub.node_errors && Object.keys(sub.node_errors).length)
+      throw new Error("The workflow was rejected: " + JSON.stringify(sub.node_errors).slice(0, 400));
+    const taskId = sub.prompt_id;
+    if (!taskId) throw new Error("No task id came back: " + JSON.stringify(sub).slice(0, 300));
+
+    const started = Date.now();
+    while (true) {
+      if (Date.now() - started > TIMEOUT_MS)
+        throw new Error("Timed out after 10 minutes. Task id: " + taskId + ". Try fewer frames.");
+      setStatus("Task id: " + taskId + "\nWaiting for the job…");
+      await sleep(4000);
+      const st = await (await api("/api/job/" + taskId + "/status", { method: "GET" }, key)).json();
+      const s = (st.status || "").toLowerCase();
+      if (["failed", "error", "cancelled"].includes(s))
+        throw new Error("Job " + s + ". Task id: " + taskId + ". " + (st.error_message || ""));
+      if (["completed", "success"].includes(s)) break;
+    }
+
+    const hist = await (await api("/api/history_v2/" + taskId, { method: "GET" }, key)).json();
+    const outs = (hist.outputs || (hist[taskId] && hist[taskId].outputs)) || {};
+    let video = null;
+    for (const node of Object.values(outs))
+      for (const list of Object.values(node))
+        if (Array.isArray(list))
+          for (const f of list)
+            if (f && f.filename && /\.(mp4|webm)$/i.test(f.filename)) video = video || f;
+    if (!video) throw new Error("The job finished but no video was found. Task id: " + taskId);
+
+    const q = new URLSearchParams({ filename: video.filename, subfolder: video.subfolder || "", type: video.type || "output" });
+    const vres = await api("/api/view?" + q, { method: "GET" }, key);
+    $("player").src = URL.createObjectURL(await vres.blob());
+    $("player").hidden = false;
+    setStatus("Done. Task id: " + taskId);
+  } catch (e) {
+    setStatus("");
+    showError(e.message);
+  } finally {
+    $("go").disabled = false;
+  }
+};
+</script>
+</body>
+</html>
